@@ -199,7 +199,7 @@ bitflags! {
 }
 
 /// The number of entries in a page table.
-const ENTRY_COUNT: usize = 512;
+pub const ENTRY_COUNT: usize = 512;
 
 /// Represents a page table.
 ///

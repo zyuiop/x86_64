@@ -84,6 +84,18 @@ impl Mapper<Size1GiB> for OffsetPageTable<'_> {
         }
     }
 
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size1GiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size1GiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        unsafe { self.inner.split_page(page, frame_allocator) }
+    }
+
     #[inline]
     fn unmap(
         &mut self,
@@ -153,6 +165,18 @@ impl Mapper<Size2MiB> for OffsetPageTable<'_> {
         }
     }
 
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size2MiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size2MiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        unsafe { self.inner.split_page(page, frame_allocator) }
+    }
+
     #[inline]
     fn unmap(
         &mut self,
@@ -220,6 +244,18 @@ impl Mapper<Size4KiB> for OffsetPageTable<'_> {
             self.inner
                 .map_to_with_table_flags(page, frame, flags, parent_table_flags, allocator)
         }
+    }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size4KiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size4KiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        unsafe { self.inner.split_page(page, frame_allocator) }
     }
 
     #[inline]

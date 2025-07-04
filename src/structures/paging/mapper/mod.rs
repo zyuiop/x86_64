@@ -279,6 +279,25 @@ pub trait Mapper<S: PageSize> {
         Self: Sized,
         A: FrameAllocator<Size4KiB> + ?Sized;
 
+    /// Splits a large or huge page into smaller pages.
+    ///
+    /// This method allocates a new page table which it fills with entries fully mapping the
+    /// previous region, then inserts that page in the parent level, replacing the large/huge page
+    /// entry.
+    ///
+    /// ## Safety
+    ///
+    /// This operation creates page table mappings, which is inherently unsafe (see
+    /// `map_to_with_table_flags`)
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<S>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<S>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized;
+
     /// Removes a mapping from the page table and returns the frame that used to be mapped.
     ///
     /// Note that no page tables or pages are deallocated.
@@ -459,6 +478,22 @@ pub enum MapToError<S: PageSize> {
     ParentEntryHugePage,
     /// The given page is already mapped to a physical frame.
     PageAlreadyMapped(PhysFrame<S>),
+}
+
+/// This error is returned from `split`
+#[derive(Debug)]
+pub enum SplitError {
+    /// The given page is already the smallest it could be and cannot be split down further
+    EntrySmallPage,
+
+    /// An additional frame was needed for the mapping process, but the frame allocator
+    /// returned `None`.
+    FrameAllocationFailed,
+    /// An upper level page table entry has the `HUGE_PAGE` flag set, which means that the
+    /// given page is part of an already mapped huge page.
+    ParentEntryHugePage,
+    /// The given page is not mapped to a physical frame.
+    PageNotMapped,
 }
 
 /// An error indicating that an `unmap` call failed.

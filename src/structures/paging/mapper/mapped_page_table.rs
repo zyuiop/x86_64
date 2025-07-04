@@ -1,8 +1,10 @@
 use crate::structures::paging::{
     mapper::*,
     page::AddressNotAligned,
+    page_table,
     page_table::{FrameError, PageTable, PageTableEntry, PageTableLevel},
 };
+use core::ops::Add;
 
 /// A Mapper implementation that relies on a PhysAddr to VirtAddr conversion function.
 ///
@@ -166,6 +168,52 @@ impl<P: PageTableFrameMapping> Mapper<Size1GiB> for MappedPageTable<'_, P> {
         self.map_to_1gib(page, frame, flags, parent_table_flags, allocator)
     }
 
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size1GiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size1GiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        let p4 = &mut self.level_4_table;
+        let p3 = self
+            .page_table_walker
+            .next_table_mut(&mut p4[page.p4_index()])?;
+
+        let p3_entry = &mut p3[page.p3_index()];
+        let flags = p3_entry.flags();
+
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err(SplitError::PageNotMapped);
+        }
+        if !flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(SplitError::EntrySmallPage);
+        }
+
+        let new_p2 = frame_allocator
+            .allocate_frame()
+            .ok_or(SplitError::FrameAllocationFailed)?;
+        let p2_ptr = unsafe {
+            &mut *self
+                .page_table_walker
+                .page_table_frame_mapping
+                .frame_to_pointer(new_p2)
+        };
+
+        for i in 0..page_table::ENTRY_COUNT {
+            p2_ptr[i].set_addr(
+                p3_entry.addr().add(Size2MiB::SIZE),
+                flags | PageTableFlags::HUGE_PAGE,
+            );
+        }
+
+        p3_entry.set_frame(new_p2, flags & !PageTableFlags::HUGE_PAGE);
+
+        Ok(MapperFlush::new(page))
+    }
+
     fn unmap(
         &mut self,
         page: Page<Size1GiB>,
@@ -272,6 +320,54 @@ impl<P: PageTableFrameMapping> Mapper<Size2MiB> for MappedPageTable<'_, P> {
         A: FrameAllocator<Size4KiB> + ?Sized,
     {
         self.map_to_2mib(page, frame, flags, parent_table_flags, allocator)
+    }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size2MiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size2MiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        let p4 = &mut self.level_4_table;
+        let p3 = self
+            .page_table_walker
+            .next_table_mut(&mut p4[page.p4_index()])?;
+        let p2 = self
+            .page_table_walker
+            .next_table_mut(&mut p3[page.p3_index()])?;
+
+        let p2_entry = &mut p2[page.p2_index()];
+        let flags = p2_entry.flags();
+
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err(SplitError::PageNotMapped);
+        }
+        if !flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(SplitError::EntrySmallPage);
+        }
+
+        let new_p1 = frame_allocator
+            .allocate_frame()
+            .ok_or(SplitError::FrameAllocationFailed)?;
+        let p1_ptr = unsafe {
+            &mut *self
+                .page_table_walker
+                .page_table_frame_mapping
+                .frame_to_pointer(new_p1)
+        };
+
+        let child_flags = flags & !PageTableFlags::HUGE_PAGE;
+
+        for i in 0..page_table::ENTRY_COUNT {
+            p1_ptr[i].set_addr(p2_entry.addr().add(Size4KiB::SIZE), child_flags);
+        }
+
+        p2_entry.set_frame(new_p1, flags & !PageTableFlags::HUGE_PAGE);
+
+        Ok(MapperFlush::new(page))
     }
 
     fn unmap(
@@ -400,6 +496,18 @@ impl<P: PageTableFrameMapping> Mapper<Size4KiB> for MappedPageTable<'_, P> {
         A: FrameAllocator<Size4KiB> + ?Sized,
     {
         self.map_to_4kib(page, frame, flags, parent_table_flags, allocator)
+    }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        _page: Page<Size4KiB>,
+        _frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size4KiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        Err(SplitError::EntrySmallPage)
     }
 
     fn unmap(
@@ -834,6 +942,16 @@ impl From<FrameError> for PageTableWalkError {
         match err {
             FrameError::HugeFrame => PageTableWalkError::MappedToHugePage,
             FrameError::FrameNotPresent => PageTableWalkError::NotMapped,
+        }
+    }
+}
+
+impl From<PageTableWalkError> for SplitError {
+    #[inline]
+    fn from(err: PageTableWalkError) -> Self {
+        match err {
+            PageTableWalkError::MappedToHugePage => SplitError::ParentEntryHugePage,
+            PageTableWalkError::NotMapped => SplitError::PageNotMapped,
         }
     }
 }

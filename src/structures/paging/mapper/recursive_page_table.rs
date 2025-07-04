@@ -1,15 +1,16 @@
 //! Access the page tables through a recursively mapped level 4 table.
 
-use core::fmt;
-
 use super::*;
 use crate::registers::control::Cr3;
 use crate::structures::paging::page_table::PageTableLevel;
 use crate::structures::paging::{
     page::{AddressNotAligned, NotGiantPageSize},
+    page_table,
     page_table::{FrameError, PageTable, PageTableEntry},
     PageTableIndex,
 };
+use core::fmt;
+use core::ops::Add;
 
 /// A recursive page table is a last level page table with an entry mapped to the table itself.
 ///
@@ -297,6 +298,37 @@ impl<'a> RecursivePageTable<'a> {
 
         Ok(MapperFlush::new(page))
     }
+
+    unsafe fn with_temporary_mapping<F>(
+        &mut self,
+        frame: PhysFrame,
+        f: F,
+    ) -> Result<(), MapToError<Size4KiB>>
+    where
+        F: FnOnce(&mut PageTable),
+    {
+        let p4 = &mut self.p4;
+        let Some((p4_index, _)) = p4.iter().enumerate().find(|(_, p)| !p.is_unused()) else {
+            return Err(MapToError::FrameAllocationFailed);
+        };
+        p4[p4_index].set_frame(frame, PageTableFlags::WRITABLE | PageTableFlags::PRESENT);
+
+        let temporary = unsafe {
+            &mut *(p3_ptr(
+                Page::from_page_table_indices_1gib(
+                    PageTableIndex::new(p4_index as u16),
+                    PageTableIndex::new(0), /* value unused */
+                ),
+                self.recursive_index,
+            ))
+        };
+
+        f(temporary);
+
+        p4[p4_index].set_unused();
+
+        Ok(())
+    }
 }
 
 impl Mapper<Size1GiB> for RecursivePageTable<'_> {
@@ -417,6 +449,53 @@ impl Mapper<Size1GiB> for RecursivePageTable<'_> {
         PhysFrame::from_start_address(p3_entry.addr())
             .map_err(|AddressNotAligned| TranslateError::InvalidFrameAddress(p3_entry.addr()))
     }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size1GiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size1GiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        let p4 = &mut self.p4;
+        let p4_entry = &p4[page.p4_index()];
+        p4_entry.frame().map_err(|err| match err {
+            FrameError::FrameNotPresent => SplitError::PageNotMapped,
+            FrameError::HugeFrame => SplitError::ParentEntryHugePage,
+        })?;
+
+        let p3 = unsafe { &mut *(p3_ptr(page, self.recursive_index)) };
+        let p3_entry = &mut p3[page.p3_index()];
+        let flags = p3_entry.flags();
+
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err(SplitError::FrameAllocationFailed);
+        }
+        if !flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(SplitError::FrameAllocationFailed);
+        }
+
+        let new_p2 = frame_allocator
+            .allocate_frame()
+            .ok_or(SplitError::FrameAllocationFailed)?;
+
+        unsafe {
+            self.with_temporary_mapping(new_p2, |p2| {
+                let child_flags = flags | PageTableFlags::HUGE_PAGE;
+
+                for i in 0..page_table::ENTRY_COUNT {
+                    p2[i].set_addr(p3_entry.addr().add(Size2MiB::SIZE), child_flags);
+                }
+            })
+            .map_err(|_| SplitError::FrameAllocationFailed)?;
+        }
+
+        p3_entry.set_frame(new_p2, flags & !PageTableFlags::HUGE_PAGE);
+
+        Ok(MapperFlush::new(page))
+    }
 }
 
 impl Mapper<Size2MiB> for RecursivePageTable<'_> {
@@ -433,6 +512,60 @@ impl Mapper<Size2MiB> for RecursivePageTable<'_> {
         A: FrameAllocator<Size4KiB> + ?Sized,
     {
         self.map_to_2mib(page, frame, flags, parent_table_flags, allocator)
+    }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        page: Page<Size2MiB>,
+        frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size2MiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        let p4 = &mut self.p4;
+        let p4_entry = &p4[page.p4_index()];
+        p4_entry.frame().map_err(|err| match err {
+            FrameError::FrameNotPresent => SplitError::PageNotMapped,
+            FrameError::HugeFrame => SplitError::ParentEntryHugePage,
+        })?;
+
+        let p3 = unsafe { &mut *(p3_ptr(page, self.recursive_index)) };
+        let p3_entry = &p3[page.p3_index()];
+        p3_entry.frame().map_err(|err| match err {
+            FrameError::FrameNotPresent => SplitError::PageNotMapped,
+            FrameError::HugeFrame => SplitError::ParentEntryHugePage,
+        })?;
+
+        let p2 = unsafe { &mut *(p2_ptr(page, self.recursive_index)) };
+        let p2_entry = &mut p2[page.p2_index()];
+        let flags = p2_entry.flags();
+
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err(SplitError::FrameAllocationFailed);
+        }
+        if !flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(SplitError::FrameAllocationFailed);
+        }
+
+        let new_p1 = frame_allocator
+            .allocate_frame()
+            .ok_or(SplitError::FrameAllocationFailed)?;
+
+        unsafe {
+            self.with_temporary_mapping(new_p1, |p1| {
+                let child_flags = flags & !PageTableFlags::HUGE_PAGE;
+
+                for i in 0..page_table::ENTRY_COUNT {
+                    p1[i].set_addr(p2_entry.addr().add(Size4KiB::SIZE), child_flags);
+                }
+            })
+            .map_err(|_| SplitError::FrameAllocationFailed)?;
+        }
+
+        p2_entry.set_frame(new_p1, flags & !PageTableFlags::HUGE_PAGE);
+
+        Ok(MapperFlush::new(page))
     }
 
     fn unmap(
@@ -588,6 +721,18 @@ impl Mapper<Size4KiB> for RecursivePageTable<'_> {
         A: FrameAllocator<Size4KiB> + ?Sized,
     {
         self.map_to_4kib(page, frame, flags, parent_table_flags, allocator)
+    }
+
+    unsafe fn split_page<A>(
+        &mut self,
+        _page: Page<Size4KiB>,
+        _frame_allocator: &mut A,
+    ) -> Result<MapperFlush<Size4KiB>, SplitError>
+    where
+        Self: Sized,
+        A: FrameAllocator<Size4KiB> + ?Sized,
+    {
+        Err(SplitError::EntrySmallPage)
     }
 
     fn unmap(
